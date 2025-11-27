@@ -1,5 +1,6 @@
 // src/kernel/mod.rs
 
+use std::fs;
 use std::io::{self, BufRead, Write};
 use std::process;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -297,6 +298,80 @@ impl CommandDaemon {
             4 // failed
         }
     }
+
+    /// Save organ health to a simple text file.
+    /// Format (one per line): <OrganKindName> <health>
+    fn save_state(&self, path: &str) -> Result<(), String> {
+        let mut out = String::new();
+        for organ in &self.topology.organs {
+            let name = match organ.kind {
+                OrganKind::Cortex => "Cortex",
+                OrganKind::Memory => "Memory",
+                OrganKind::IoBridge => "IoBridge",
+                OrganKind::SensorHub => "SensorHub",
+                OrganKind::MotorControl => "MotorControl",
+                OrganKind::Network => "Network",
+                OrganKind::Storage => "Storage",
+            };
+            out.push_str(&format!("{} {:.4}\n", name, organ.health));
+        }
+
+        fs::write(path, out).map_err(|e| format!("failed to save state: {}", e))?;
+        Ok(())
+    }
+
+    /// Load organ health from a simple text file.
+    /// Unknown organs or malformed lines are ignored.
+    fn load_state(&mut self, path: &str) -> Result<(), String> {
+        let data = fs::read_to_string(path).map_err(|e| format!("failed to load state: {}", e))?;
+
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() != 2 {
+                continue;
+            }
+
+            let organ_name = parts[0];
+            let value_str = parts[1];
+
+            // First: try the generic parser (handles cortex/memory/io/etc.)
+            let organ_kind_opt = self
+                .parse_organ_kind(organ_name)
+                .or_else(|| match organ_name {
+                    // Also support exact names used when saving
+                    "IoBridge" => Some(OrganKind::IoBridge),
+                    "SensorHub" => Some(OrganKind::SensorHub),
+                    "MotorControl" => Some(OrganKind::MotorControl),
+                    "Network" => Some(OrganKind::Network),
+                    "Storage" => Some(OrganKind::Storage),
+                    _ => None,
+                });
+
+            let organ_kind = match organ_kind_opt {
+                Some(k) => k,
+                None => continue,
+            };
+
+            let value: f32 = match value_str.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Apply new health
+            for organ in self.topology.organs.iter_mut() {
+                if organ.kind == organ_kind {
+                    organ.health = value.clamp(0.0, 1.0);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Daemon for CommandDaemon {
@@ -456,7 +531,7 @@ impl Daemon for CommandDaemon {
                             bus.emit(
                                 PulseKind::Command,
                                 self.name(),
-                                "commands: help, status, topology, nodes, organs, peripherals, health, awareness, alerts, damage <organ> <amount>, heal <organ> <amount>, logs all, logs commands, logs silent, quit",
+                                "commands: help, status, topology, nodes, organs, peripherals, health, awareness, alerts, save state, load state, damage <organ> <amount>, heal <organ> <amount>, logs all, logs commands, logs silent, quit",
                             );
                         }
 
@@ -623,6 +698,50 @@ impl Daemon for CommandDaemon {
                                 self.name(),
                                 format!("awareness index: {:.2} :: {}", score, level),
                             );
+                        }
+
+                        "save state" => {
+                            match self.save_state("aion_state.txt") {
+                                Ok(()) => {
+                                    bus.emit(
+                                        PulseKind::Command,
+                                        self.name(),
+                                        "state saved to aion_state.txt",
+                                    );
+                                }
+                                Err(e) => {
+                                    bus.emit(
+                                        PulseKind::Command,
+                                        self.name(),
+                                        format!("save failed: {}", e),
+                                    );
+                                }
+                            }
+                        }
+
+                        "load state" => {
+                            match self.load_state("aion_state.txt") {
+                                Ok(()) => {
+                                    let awareness = compute_awareness(&self.topology);
+                                    bus.awareness_score = awareness;
+
+                                    bus.emit(
+                                        PulseKind::Command,
+                                        self.name(),
+                                        format!(
+                                            "state loaded from aion_state.txt (awareness {:.2})",
+                                            awareness
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    bus.emit(
+                                        PulseKind::Command,
+                                        self.name(),
+                                        format!("load failed: {}", e),
+                                    );
+                                }
+                            }
                         }
 
                         "logs all" => {
