@@ -1,10 +1,14 @@
+// src/kernel/mod.rs
+
 use std::io::{self, BufRead, Write};
+use std::process;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::process; 
 
-use crate::organism::{self, SystemTopology, format_topology_brief};
+use crate::organism::{
+    self, compute_awareness, format_topology_brief, OrganKind, SystemTopology,
+};
 
 /// Different categories of pulses travelling on the bus.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -14,7 +18,6 @@ pub enum PulseKind {
     Command,
     Ai,
 }
-
 
 /// Very simple message bus for now: just logs pulses with an incrementing ID.
 /// Later this can route to organs, nodes, external transports, etc.
@@ -26,10 +29,10 @@ pub enum LogFilter {
     Silent,
 }
 
-
 pub struct Bus {
     next_id: u64,
     pub log_filter: LogFilter,
+    pub awareness_score: f32, // 0.0–1.0
 }
 
 impl Bus {
@@ -37,6 +40,7 @@ impl Bus {
         Self {
             next_id: 0,
             log_filter: LogFilter::CommandsOnly, // default: clean UI
+            awareness_score: 1.0,                // start fully aware
         }
     }
 
@@ -44,7 +48,6 @@ impl Bus {
         self.next_id += 1;
         let data = data.into();
 
-        // LOG RULES:
         match self.log_filter {
             LogFilter::All => {
                 println!(
@@ -66,7 +69,6 @@ impl Bus {
         }
     }
 }
-
 
 pub fn boot() {
     println!("[AION-KERNEL] Boot sequence started.");
@@ -148,18 +150,43 @@ impl Daemon for StatusDaemon {
 
             let brief = format_topology_brief(&self.topology);
 
+            // Compute min organ health as a crude "system health" metric
+            let mut min_health = 1.0f32;
+            for organ in &self.topology.organs {
+                if organ.health < min_health {
+                    min_health = organ.health;
+                }
+            }
+
+            let health_level = if min_health >= 0.85 {
+                "healthy"
+            } else if min_health >= 0.6 {
+                "degraded"
+            } else if min_health >= 0.35 {
+                "impaired"
+            } else if min_health > 0.0 {
+                "critical"
+            } else {
+                "failed"
+            };
+
+            let awareness = compute_awareness(&self.topology);
+            bus.awareness_score = awareness;
+
             bus.emit(
                 PulseKind::Status,
                 self.name(),
-                format!("status tick #{} :: {}", self.counter, brief),
+                format!(
+                    "status tick #{} :: {} :: health {:.2} ({}) :: awareness {:.2}",
+                    self.counter, brief, min_health, health_level, awareness
+                ),
             );
         }
     }
 }
 
 /// A daemon representing the AI Cortex: all high-level intelligence lives here.
-///
-/// In this early phase it just emits simulated "cortex cycles".
+/// It reacts to the awareness index carried on the bus.
 pub struct AiDaemon {
     last_run: Instant,
     interval: Duration,
@@ -186,11 +213,26 @@ impl Daemon for AiDaemon {
             self.cycle += 1;
             self.last_run = now;
 
-            // Later: this is where model inference, planning, and learning would run.
+            let awareness = bus.awareness_score;
+            let level = if awareness >= 0.85 {
+                "optimal"
+            } else if awareness >= 0.6 {
+                "stable"
+            } else if awareness >= 0.35 {
+                "impaired"
+            } else if awareness > 0.0 {
+                "critical"
+            } else {
+                "unconscious"
+            };
+
             bus.emit(
                 PulseKind::Ai,
                 self.name(),
-                format!("cortex cycle #{} (simulated)", self.cycle),
+                format!(
+                    "cortex cycle #{} :: awareness {:.2} ({})",
+                    self.cycle, awareness, level
+                ),
             );
         }
     }
@@ -206,6 +248,54 @@ pub struct CommandDaemon {
 impl CommandDaemon {
     pub fn new(rx: Receiver<String>, topology: SystemTopology) -> Self {
         Self { rx, topology }
+    }
+
+    fn parse_organ_kind(&self, name: &str) -> Option<OrganKind> {
+        match name.to_lowercase().as_str() {
+            "cortex" => Some(OrganKind::Cortex),
+            "memory" => Some(OrganKind::Memory),
+            "io" | "io_bridge" | "io-bridge" | "iobridge" => Some(OrganKind::IoBridge),
+            _ => None,
+        }
+    }
+
+    fn adjust_organ_health(&mut self, kind: OrganKind, delta: f32) -> Option<f32> {
+        for organ in self.topology.organs.iter_mut() {
+            if organ.kind == kind {
+                let new_health = (organ.health + delta).clamp(0.0, 1.0);
+                organ.health = new_health;
+                return Some(new_health);
+            }
+        }
+        None
+    }
+
+    fn classify_health_label(&self, health: f32) -> &'static str {
+        if health >= 0.85 {
+            "ok"
+        } else if health >= 0.6 {
+            "degraded"
+        } else if health >= 0.35 {
+            "impaired"
+        } else if health > 0.0 {
+            "critical"
+        } else {
+            "failed"
+        }
+    }
+
+    fn health_severity(&self, health: f32) -> u8 {
+        if health >= 0.85 {
+            0 // ok
+        } else if health >= 0.6 {
+            1 // degraded
+        } else if health >= 0.35 {
+            2 // impaired
+        } else if health > 0.0 {
+            3 // critical
+        } else {
+            4 // failed
+        }
     }
 }
 
@@ -223,118 +313,362 @@ impl Daemon for CommandDaemon {
                         continue;
                     }
 
- match trimmed {
-    "help" => {
-        bus.emit(
-            PulseKind::Command,
-            self.name(),
-            "commands: help, status, topology, nodes, organs, peripherals, logs all, logs commands, logs silent, quit",
-        );
-    }
+                    // Parameterized commands: damage/heal
+                    if let Some(rest) = trimmed.strip_prefix("damage ") {
+                        let parts: Vec<&str> = rest.split_whitespace().collect();
+                        if parts.len() != 2 {
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                "usage: damage <organ> <amount>",
+                            );
+                            continue;
+                        }
 
-    "status" => {
-        let brief = format_topology_brief(&self.topology);
-        bus.emit(
-            PulseKind::Command,
-            self.name(),
-            format!("manual status :: {}", brief),
-        );
-    }
+                        let organ_name = parts[0];
+                        let amount_str = parts[1];
 
-    "topology" => {
-        let mut details = String::new();
-        details.push_str("Topology detail:\n");
-        for node in &self.topology.nodes {
-            details.push_str(&format!(
-                " - Node {} [{}]: {}\n",
-                node.id.0, node.label, node.role
-            ));
-        }
-        for organ in &self.topology.organs {
-            details.push_str(&format!(
-                "   - Organ {:?} on Node {} (health {:.2})\n",
-                organ.kind, organ.node.0, organ.health
-            ));
-        }
+                        let organ_kind = match self.parse_organ_kind(organ_name) {
+                            Some(k) => k,
+                            None => {
+                                bus.emit(
+                                    PulseKind::Command,
+                                    self.name(),
+                                    format!("unknown organ '{}'", organ_name),
+                                );
+                                continue;
+                            }
+                        };
 
-        bus.emit(PulseKind::Command, self.name(), details);
-    }
+                        let amount: f32 = match amount_str.parse() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                bus.emit(
+                                    PulseKind::Command,
+                                    self.name(),
+                                    format!("invalid amount '{}'", amount_str),
+                                );
+                                continue;
+                            }
+                        };
 
-    "nodes" => {
-        let mut details = String::new();
-        details.push_str("Nodes:\n");
-        for node in &self.topology.nodes {
-            details.push_str(&format!(
-                " - Node {} [{}]: {}\n",
-                node.id.0, node.label, node.role
-            ));
-        }
-        bus.emit(PulseKind::Command, self.name(), details);
-    }
+                        let delta = -amount.abs();
+                        match self.adjust_organ_health(organ_kind, delta) {
+                            Some(new_health) => {
+                                let awareness = compute_awareness(&self.topology);
+                                bus.awareness_score = awareness;
 
-    "organs" => {
-        let mut details = String::new();
-        details.push_str("Organs:\n");
-        for organ in &self.topology.organs {
-            details.push_str(&format!(
-                " - Organ {:?} on Node {} (health {:.2})\n",
-                organ.kind, organ.node.0, organ.health
-            ));
-        }
-        bus.emit(PulseKind::Command, self.name(), details);
-    }
+                                bus.emit(
+                                    PulseKind::Command,
+                                    self.name(),
+                                    format!(
+                                        "damaged {:?} by {:.2}, new health {:.2} (awareness {:.2})",
+                                        organ_kind, amount, new_health, awareness
+                                    ),
+                                );
+                            }
+                            None => {
+                                bus.emit(
+                                    PulseKind::Command,
+                                    self.name(),
+                                    format!(
+                                        "organ {:?} not found in topology",
+                                        organ_kind
+                                    ),
+                                );
+                            }
+                        }
 
-    "peripherals" => {
-        let mut details = String::new();
-        details.push_str("Peripherals by organ:\n");
-        for organ in &self.topology.organs {
-            if organ.peripherals.is_empty() {
-                continue;
-            }
-            details.push_str(&format!(" - Organ {:?}:\n", organ.kind));
-            for p in &organ.peripherals {
-                details.push_str(&format!("    - {:?}: {}\n", p.kind, p.name));
-            }
-        }
-        if !details.contains("Organ") {
-            details.push_str(" (no peripherals registered)\n");
-        }
-        bus.emit(PulseKind::Command, self.name(), details);
-    }
+                        continue;
+                    }
 
-    "logs all" => {
-        bus.log_filter = LogFilter::All;
-        bus.emit(PulseKind::Command, self.name(), "logging: ALL pulses");
-    }
+                    if let Some(rest) = trimmed.strip_prefix("heal ") {
+                        let parts: Vec<&str> = rest.split_whitespace().collect();
+                        if parts.len() != 2 {
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                "usage: heal <organ> <amount>",
+                            );
+                            continue;
+                        }
 
-    "logs commands" => {
-        bus.log_filter = LogFilter::CommandsOnly;
-        bus.emit(PulseKind::Command, self.name(), "logging: COMMANDS ONLY");
-    }
+                        let organ_name = parts[0];
+                        let amount_str = parts[1];
 
-    "logs silent" | "logs off" => {
-        bus.log_filter = LogFilter::Silent;
-        bus.emit(PulseKind::Command, self.name(), "logging: SILENT");
-    }
+                        let organ_kind = match self.parse_organ_kind(organ_name) {
+                            Some(k) => k,
+                            None => {
+                                bus.emit(
+                                    PulseKind::Command,
+                                    self.name(),
+                                    format!("unknown organ '{}'", organ_name),
+                                );
+                                continue;
+                            }
+                        };
 
-    "quit" => {
-        bus.emit(
-            PulseKind::Command,
-            self.name(),
-            "shutting down kernel (process::exit(0))",
-        );
-        process::exit(0);
-    }
+                        let amount: f32 = match amount_str.parse() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                bus.emit(
+                                    PulseKind::Command,
+                                    self.name(),
+                                    format!("invalid amount '{}'", amount_str),
+                                );
+                                continue;
+                            }
+                        };
 
-    _ => {
-        bus.emit(
-            PulseKind::Command,
-            self.name(),
-            format!("unknown command: '{}'", trimmed),
-        );
-    }
-}
+                        let delta = amount.abs();
+                        match self.adjust_organ_health(organ_kind, delta) {
+                            Some(new_health) => {
+                                let awareness = compute_awareness(&self.topology);
+                                bus.awareness_score = awareness;
 
+                                bus.emit(
+                                    PulseKind::Command,
+                                    self.name(),
+                                    format!(
+                                        "healed {:?} by {:.2}, new health {:.2} (awareness {:.2})",
+                                        organ_kind, amount, new_health, awareness
+                                    ),
+                                );
+                            }
+                            None => {
+                                bus.emit(
+                                    PulseKind::Command,
+                                    self.name(),
+                                    format!(
+                                        "organ {:?} not found in topology",
+                                        organ_kind
+                                    ),
+                                );
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    // Simple commands (no parameters)
+                    match trimmed {
+                        "help" => {
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                "commands: help, status, topology, nodes, organs, peripherals, health, awareness, alerts, damage <organ> <amount>, heal <organ> <amount>, logs all, logs commands, logs silent, quit",
+                            );
+                        }
+
+                        "status" => {
+                            let brief = format_topology_brief(&self.topology);
+                            let awareness = compute_awareness(&self.topology);
+                            bus.awareness_score = awareness;
+
+                            // Also compute overall system health for human-readable status
+                            let mut min_health = 1.0f32;
+                            for organ in &self.topology.organs {
+                                if organ.health < min_health {
+                                    min_health = organ.health;
+                                }
+                            }
+                            let health_level = self.classify_health_label(min_health);
+
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                format!(
+                                    "manual status :: {} :: health {:.2} ({}) :: awareness {:.2}",
+                                    brief, min_health, health_level, awareness
+                                ),
+                            );
+                        }
+
+                        "topology" => {
+                            let mut details = String::new();
+                            details.push_str("Topology detail:\n");
+                            for node in &self.topology.nodes {
+                                details.push_str(&format!(
+                                    " - Node {} [{}]: {}\n",
+                                    node.id.0, node.label, node.role
+                                ));
+                            }
+                            for organ in &self.topology.organs {
+                                details.push_str(&format!(
+                                    "   - Organ {:?} on Node {} (health {:.2})\n",
+                                    organ.kind, organ.node.0, organ.health
+                                ));
+                            }
+
+                            bus.emit(PulseKind::Command, self.name(), details);
+                        }
+
+                        "nodes" => {
+                            let mut details = String::new();
+                            details.push_str("Nodes:\n");
+                            for node in &self.topology.nodes {
+                                details.push_str(&format!(
+                                    " - Node {} [{}]: {}\n",
+                                    node.id.0, node.label, node.role
+                                ));
+                            }
+                            bus.emit(PulseKind::Command, self.name(), details);
+                        }
+
+                        "organs" => {
+                            let mut details = String::new();
+                            details.push_str("Organs:\n");
+                            for organ in &self.topology.organs {
+                                details.push_str(&format!(
+                                    " - Organ {:?} on Node {} (health {:.2})\n",
+                                    organ.kind, organ.node.0, organ.health
+                                ));
+                            }
+                            bus.emit(PulseKind::Command, self.name(), details);
+                        }
+
+                        "peripherals" => {
+                            let mut details = String::new();
+                            details.push_str("Peripherals by organ:\n");
+                            for organ in &self.topology.organs {
+                                if organ.peripherals.is_empty() {
+                                    continue;
+                                }
+                                details.push_str(&format!(" - Organ {:?}:\n", organ.kind));
+                                for p in &organ.peripherals {
+                                    details.push_str(&format!(
+                                        "    - {:?}: {}\n",
+                                        p.kind, p.name
+                                    ));
+                                }
+                            }
+                            if !details.contains("Organ") {
+                                details.push_str(" (no peripherals registered)\n");
+                            }
+                            bus.emit(PulseKind::Command, self.name(), details);
+                        }
+
+                        "health" => {
+                            let mut details = String::new();
+                            details.push_str("Organ health:\n");
+                            for organ in &self.topology.organs {
+                                let label = self.classify_health_label(organ.health);
+                                details.push_str(&format!(
+                                    " - {:?}: {:.2} ({})\n",
+                                    organ.kind, organ.health, label
+                                ));
+                            }
+                            bus.emit(PulseKind::Command, self.name(), details);
+                        }
+
+                        "alerts" => {
+                            let mut details = String::new();
+                            let mut worst_severity = 0u8;
+                            let mut any_alerts = false;
+
+                            details.push_str("Alerts:\n");
+
+                            for organ in &self.topology.organs {
+                                let sev = self.health_severity(organ.health);
+                                if sev == 0 {
+                                    continue; // ok, no alert
+                                }
+                                any_alerts = true;
+                                if sev > worst_severity {
+                                    worst_severity = sev;
+                                }
+
+                                let label = self.classify_health_label(organ.health);
+                                details.push_str(&format!(
+                                    " - {:?}: {:.2} [{}]\n",
+                                    organ.kind, organ.health, label
+                                ));
+                            }
+
+                            if !any_alerts {
+                                details.push_str(" (no active alerts; all organs healthy)\n");
+                            } else {
+                                let overall = match worst_severity {
+                                    1 => "overall: degraded",
+                                    2 => "overall: impaired",
+                                    3 => "overall: critical",
+                                    4 => "overall: failed",
+                                    _ => "overall: ok",
+                                };
+                                details.push_str(overall);
+                                details.push('\n');
+                            }
+
+                            bus.emit(PulseKind::Command, self.name(), details);
+                        }
+
+                        "awareness" => {
+                            let score = compute_awareness(&self.topology);
+                            bus.awareness_score = score;
+
+                            let level = if score >= 0.85 {
+                                "optimal"
+                            } else if score >= 0.6 {
+                                "stable"
+                            } else if score >= 0.35 {
+                                "impaired"
+                            } else if score > 0.0 {
+                                "critical"
+                            } else {
+                                "unconscious"
+                            };
+
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                format!("awareness index: {:.2} :: {}", score, level),
+                            );
+                        }
+
+                        "logs all" => {
+                            bus.log_filter = LogFilter::All;
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                "logging: ALL pulses",
+                            );
+                        }
+
+                        "logs commands" => {
+                            bus.log_filter = LogFilter::CommandsOnly;
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                "logging: COMMANDS ONLY",
+                            );
+                        }
+
+                        "logs silent" | "logs off" => {
+                            bus.log_filter = LogFilter::Silent;
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                "logging: SILENT",
+                            );
+                        }
+
+                        "quit" => {
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                "shutting down kernel (process::exit(0))",
+                            );
+                            process::exit(0);
+                        }
+
+                        _ => {
+                            bus.emit(
+                                PulseKind::Command,
+                                self.name(),
+                                format!("unknown command: '{}'", trimmed),
+                            );
+                        }
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -382,7 +716,6 @@ pub fn run_loop(mut bus: Bus) {
 
     let mut daemons: Vec<Box<dyn Daemon>> = Vec::new();
 
-    // Later: build this list from config, discovery, etc.
     daemons.push(Box::new(HeartbeatDaemon::new(Duration::from_millis(1000))));
     daemons.push(Box::new(StatusDaemon::new(
         Duration::from_millis(5000),
@@ -398,7 +731,6 @@ pub fn run_loop(mut bus: Bus) {
             daemon.tick(now, &mut bus);
         }
 
-        // crude scheduler: sleep a bit to avoid busy loop
         thread::sleep(Duration::from_millis(50));
     }
 }

@@ -1,6 +1,6 @@
-#![allow(dead_code)] // We are intentionally defining more than we use (for now).
+// src/organism/mod.rs
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrganKind {
     Cortex,
     Memory,
@@ -70,18 +70,9 @@ pub struct SystemTopology {
     pub organs: Vec<Organ>,
 }
 
-impl SystemTopology {
-    pub fn find_organs_on_node(&self, node_id: NodeId) -> Vec<&Organ> {
-        self.organs
-            .iter()
-            .filter(|o| o.node.0 == node_id.0)
-            .collect()
-    }
-}
-
-/// A small hard-coded topology for the early simulation.
-///
-/// Later this will be discovered from real hardware and config.
+/// A fixed sample topology for the AION sim-kernel.
+/// core-0: primary brain
+/// io-0:   peripheral bridge
 pub fn sample_topology() -> SystemTopology {
     let node_core = Node {
         id: NodeId(1),
@@ -104,7 +95,7 @@ pub fn sample_topology() -> SystemTopology {
             CapabilityKind::Planning,
             CapabilityKind::Learning,
         ],
-            health: 0.98,
+        health: 0.98,
         peripherals: vec![
             Peripheral {
                 kind: PeripheralKind::Cpu,
@@ -134,9 +125,9 @@ pub fn sample_topology() -> SystemTopology {
         node: node_io.id,
         kind: OrganKind::IoBridge,
         caps: vec![
-            CapabilityKind::Perception,
-            CapabilityKind::Actuation,
             CapabilityKind::Networking,
+            CapabilityKind::Actuation,
+            CapabilityKind::Perception,
         ],
         health: 0.97,
         peripherals: vec![
@@ -161,21 +152,41 @@ pub fn sample_topology() -> SystemTopology {
     }
 }
 
-/// Compact human-readable summary for status reports.
+/// Compute an overall awareness index for the system based on organ health.
+/// 0.0 = unconscious / failed, 1.0 = fully healthy.
+/// Cortex, Memory, and IoBridge are weighted as primary contributors.
+pub fn compute_awareness(topology: &SystemTopology) -> f32 {
+    let mut cortex_health = 1.0f32;
+    let mut memory_health = 1.0f32;
+    let mut io_health = 1.0f32;
+
+    for organ in &topology.organs {
+        match organ.kind {
+            OrganKind::Cortex => cortex_health = organ.health,
+            OrganKind::Memory => memory_health = organ.health,
+            OrganKind::IoBridge => io_health = organ.health,
+            _ => {}
+        }
+    }
+
+    let score = cortex_health * 0.5 + memory_health * 0.3 + io_health * 0.2;
+    score.clamp(0.0, 1.0)
+}
+
+/// Compact summary for status daemon / commands.
 pub fn format_topology_brief(topology: &SystemTopology) -> String {
     let node_count = topology.nodes.len();
     let organ_count = topology.organs.len();
 
-    let node_labels: Vec<String> = topology
-        .nodes
-        .iter()
-        .map(|n| format!("{} ({})", n.label, n.role))
-        .collect();
+    let mut roles: Vec<String> = Vec::new();
+    for node in &topology.nodes {
+        roles.push(format!("{} ({})", node.label, node.role));
+    }
 
     format!(
         "{} node(s), {} organ(s) :: {}",
         node_count,
         organ_count,
-        node_labels.join(", ")
+        roles.join(", ")
     )
 }
