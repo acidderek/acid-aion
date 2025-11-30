@@ -1,4 +1,6 @@
-/target
+target/
 **/*.rs.bk
+*.swp
+*.swo
 .DS_Store
-.vscode/
+aion_state.txt
