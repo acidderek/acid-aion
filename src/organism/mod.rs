@@ -1,6 +1,9 @@
-// src/organism/mod.rs
+//! Organism model for AION.
+//!
+//! Represents the system as nodes + organs + peripherals,
+//! with health and awareness semantics.
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrganKind {
     Cortex,
     Memory,
@@ -11,7 +14,7 @@ pub enum OrganKind {
     Storage,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CapabilityKind {
     Compute,
     Perception,
@@ -57,6 +60,18 @@ pub struct Organ {
     pub peripherals: Vec<Peripheral>,
 }
 
+impl Organ {
+    /// Does this organ provide a specific capability?
+    pub fn has_capability(&self, cap: CapabilityKind) -> bool {
+        self.caps.iter().any(|c| *c == cap)
+    }
+
+    /// Does this organ provide any of the listed capabilities?
+    pub fn has_any_capability(&self, caps: &[CapabilityKind]) -> bool {
+        self.caps.iter().any(|c| caps.contains(c))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: NodeId,
@@ -70,9 +85,13 @@ pub struct SystemTopology {
     pub organs: Vec<Organ>,
 }
 
-/// A fixed sample topology for the AION sim-kernel.
-/// core-0: primary brain
-/// io-0:   peripheral bridge
+/// Build a simple sample topology:
+///
+/// - Node 1: core-0 (primary brain)
+///   - Cortex organ
+///   - Memory organ
+/// - Node 2: io-0 (peripheral bridge)
+///   - IoBridge organ
 pub fn sample_topology() -> SystemTopology {
     let node_core = Node {
         id: NodeId(1),
@@ -112,7 +131,10 @@ pub fn sample_topology() -> SystemTopology {
         id: OrganId(2),
         node: node_core.id,
         kind: OrganKind::Memory,
-        caps: vec![CapabilityKind::Storage],
+        caps: vec![
+            CapabilityKind::Storage,
+            CapabilityKind::Perception,
+        ],
         health: 0.99,
         peripherals: vec![Peripheral {
             kind: PeripheralKind::Disk,
@@ -127,7 +149,6 @@ pub fn sample_topology() -> SystemTopology {
         caps: vec![
             CapabilityKind::Networking,
             CapabilityKind::Actuation,
-            CapabilityKind::Perception,
         ],
         health: 0.97,
         peripherals: vec![
@@ -152,41 +173,94 @@ pub fn sample_topology() -> SystemTopology {
     }
 }
 
-/// Compute an overall awareness index for the system based on organ health.
-/// 0.0 = unconscious / failed, 1.0 = fully healthy.
-/// Cortex, Memory, and IoBridge are weighted as primary contributors.
-pub fn compute_awareness(topology: &SystemTopology) -> f32 {
-    let mut cortex_health = 1.0f32;
-    let mut memory_health = 1.0f32;
-    let mut io_health = 1.0f32;
-
-    for organ in &topology.organs {
-        match organ.kind {
-            OrganKind::Cortex => cortex_health = organ.health,
-            OrganKind::Memory => memory_health = organ.health,
-            OrganKind::IoBridge => io_health = organ.health,
-            _ => {}
-        }
-    }
-
-    let score = cortex_health * 0.5 + memory_health * 0.3 + io_health * 0.2;
-    score.clamp(0.0, 1.0)
-}
-
-/// Compact summary for status daemon / commands.
+/// Return a brief summary used in status messages.
 pub fn format_topology_brief(topology: &SystemTopology) -> String {
     let node_count = topology.nodes.len();
     let organ_count = topology.organs.len();
 
-    let mut roles: Vec<String> = Vec::new();
+    let mut node_labels = Vec::new();
     for node in &topology.nodes {
-        roles.push(format!("{} ({})", node.label, node.role));
+        node_labels.push(format!("{} ({})", node.label, node.role));
     }
 
-    format!(
-        "{} node(s), {} organ(s) :: {}",
-        node_count,
-        organ_count,
-        roles.join(", ")
-    )
+    if node_labels.is_empty() {
+        format!("{} node(s), {} organ(s)", node_count, organ_count)
+    } else {
+        format!(
+            "{} node(s), {} organ(s) :: {}",
+            node_count,
+            organ_count,
+            node_labels.join(", ")
+        )
+    }
+}
+
+/// Compute an awareness index (0.0–1.0) from organ healths.
+///
+/// Phase 1: weighted by core organs.
+/// - Cortex  : 0.4
+/// - Memory  : 0.3
+/// - IoBridge: 0.3
+pub fn compute_awareness(topology: &SystemTopology) -> f32 {
+    let mut cortex_h = 1.0;
+    let mut memory_h = 1.0;
+    let mut io_h = 1.0;
+
+    for organ in &topology.organs {
+        match organ.kind {
+            OrganKind::Cortex => cortex_h = organ.health,
+            OrganKind::Memory => memory_h = organ.health,
+            OrganKind::IoBridge => io_h = organ.health,
+            _ => {}
+        }
+    }
+
+    let awareness = 0.4 * cortex_h + 0.3 * memory_h + 0.3 * io_h;
+    awareness.clamp(0.0, 1.0)
+}
+
+/// Turn an awareness score into a human-readable label.
+///
+/// - ≥ 0.85       → "optimal"
+/// - 0.60 – 0.85  → "stable"
+/// - 0.35 – 0.60  → "impaired"
+/// - 0.01 – 0.35  → "critical"
+/// - 0.0          → "unconscious"
+pub fn describe_awareness(a: f32) -> &'static str {
+    let v = a.clamp(0.0, 1.0);
+    if v >= 0.85 {
+        "optimal"
+    } else if v >= 0.60 {
+        "stable"
+    } else if v >= 0.35 {
+        "impaired"
+    } else if v > 0.0 {
+        "critical"
+    } else {
+        "unconscious"
+    }
+}
+
+/// Find all organs that provide a given capability.
+pub fn organs_with_capability<'a>(
+    topology: &'a SystemTopology,
+    cap: CapabilityKind,
+) -> Vec<&'a Organ> {
+    topology
+        .organs
+        .iter()
+        .filter(|o| o.has_capability(cap))
+        .collect()
+}
+
+/// Find all organs that provide *any* of the requested capabilities.
+pub fn organs_with_any_capability<'a>(
+    topology: &'a SystemTopology,
+    caps: &[CapabilityKind],
+) -> Vec<&'a Organ> {
+    topology
+        .organs
+        .iter()
+        .filter(|o| o.has_any_capability(caps))
+        .collect()
 }

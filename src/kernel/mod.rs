@@ -1,47 +1,69 @@
-// src/kernel/mod.rs
-
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::process;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::http::HttpServer;
+use crate::memory::{MemoryBus, MemoryScope};
 use crate::organism::{
-    self, compute_awareness, format_topology_brief, OrganKind, SystemTopology,
+    self, format_topology_brief, Organ, OrganKind, SystemTopology,
+};
+use crate::telemetry::{
+    self, TelemetryProvider, SimLevel,
+    sim::SimulatedTelemetry,
+    real::RealTelemetry,
+    CpuGpuMetrics, MemoryMetrics, IoMetrics,
 };
 
 /// Different categories of pulses travelling on the bus.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PulseKind {
     Heartbeat,
     Status,
     Command,
     Ai,
+    Sim,
 }
 
-/// Very simple message bus for now: just logs pulses with an incrementing ID.
-/// Later this can route to organs, nodes, external transports, etc.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Which telemetry backend is currently active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryMode {
+    Simulated,
+    Real,
+}
+
+/// Log filtering for bus output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFilter {
     All,
     CommandsOnly,
     Silent,
 }
 
+/// Simple message bus. Right now it just logs, but it also
+/// tracks global "world" state like awareness and sim level.
+/// It now carries a shared MemoryBus (from src/memory).
 pub struct Bus {
     next_id: u64,
     pub log_filter: LogFilter,
-    pub awareness_score: f32, // 0.0–1.0
+    pub sim_level: SimLevel,
+    pub awareness_score: f32,
+    pub telemetry_mode: TelemetryMode,
+    pub memory: MemoryBus,
 }
 
 impl Bus {
     pub fn new() -> Self {
         Self {
             next_id: 0,
-            log_filter: LogFilter::CommandsOnly, // default: clean UI
-            awareness_score: 1.0,                // start fully aware
+            log_filter: LogFilter::CommandsOnly,
+            sim_level: SimLevel::Low,
+            awareness_score: 1.0,
+            telemetry_mode: TelemetryMode::Simulated,
+            memory: MemoryBus::new(),
         }
     }
 
@@ -76,6 +98,14 @@ pub fn boot() {
     println!("[AION-KERNEL] Initializing messaging bus...");
     println!("[AION-KERNEL] Loading core daemons...");
     println!("[AION-KERNEL] Kernel online.");
+}
+
+/// A snapshot of the most recent telemetry as seen by the StatusDaemon.
+#[derive(Debug, Clone, Copy)]
+pub struct TelemetrySnapshot {
+    pub cpu: CpuGpuMetrics,
+    pub mem: MemoryMetrics,
+    pub io: IoMetrics,
 }
 
 /// Basic interface for any long-running kernel task.
@@ -121,20 +151,68 @@ impl Daemon for HeartbeatDaemon {
 }
 
 /// A daemon that reports overall system / organism status.
+/// In Phase 1 it also uses a TelemetryProvider to gently
+/// pull organ health toward values derived from metrics.
 pub struct StatusDaemon {
     last_run: Instant,
     interval: Duration,
     counter: u64,
-    topology: SystemTopology,
+    topology: Arc<Mutex<SystemTopology>>,
+    telemetry: Box<dyn TelemetryProvider>,
+    /// Shared snapshot for the `metrics` command / HTTP.
+    metrics_snapshot: Arc<Mutex<Option<TelemetrySnapshot>>>,
 }
 
 impl StatusDaemon {
-    pub fn new(interval: Duration, topology: SystemTopology) -> Self {
+    pub fn new(
+        interval: Duration,
+        topology: Arc<Mutex<SystemTopology>>,
+        telemetry: Box<dyn TelemetryProvider>,
+        metrics_snapshot: Arc<Mutex<Option<TelemetrySnapshot>>>,
+    ) -> Self {
         Self {
             last_run: Instant::now(),
             interval,
             counter: 0,
             topology,
+            telemetry,
+            metrics_snapshot,
+        }
+    }
+
+    /// Blend current organ health toward a target health (0.0–1.0).
+    /// `alpha` controls how fast we move: 0.0 = no change, 1.0 = snap.
+    fn blend_health(current: f32, target: f32, alpha: f32) -> f32 {
+        let c = current.clamp(0.0, 1.0);
+        let t = target.clamp(0.0, 1.0);
+        (1.0 - alpha) * c + alpha * t
+    }
+
+    fn apply_telemetry_to_topology(
+        topology: &mut SystemTopology,
+        cpu_gpu: &CpuGpuMetrics,
+        mem: &MemoryMetrics,
+        io: &IoMetrics,
+    ) {
+        let target_cortex = telemetry::compute_cortex_health(cpu_gpu);
+        let target_memory = telemetry::compute_memory_health(mem);
+        let target_iobridge = telemetry::compute_iobridge_health(io);
+
+        let alpha = 0.25; // 25% toward telemetry per status tick
+
+        for organ in &mut topology.organs {
+            match organ.kind {
+                OrganKind::Cortex => {
+                    organ.health = Self::blend_health(organ.health, target_cortex, alpha);
+                }
+                OrganKind::Memory => {
+                    organ.health = Self::blend_health(organ.health, target_memory, alpha);
+                }
+                OrganKind::IoBridge => {
+                    organ.health = Self::blend_health(organ.health, target_iobridge, alpha);
+                }
+                _ => { /* other organs not wired yet */ }
+            }
         }
     }
 }
@@ -145,61 +223,78 @@ impl Daemon for StatusDaemon {
     }
 
     fn tick(&mut self, now: Instant, bus: &mut Bus) {
-        if now.duration_since(self.last_run) >= self.interval {
-            self.counter += 1;
-            self.last_run = now;
+        if now.duration_since(self.last_run) < self.interval {
+            return;
+        }
 
-            let brief = format_topology_brief(&self.topology);
+        self.counter += 1;
+        self.last_run = now;
 
-            // Compute min organ health as a crude "system health" metric
-            let mut min_health = 1.0f32;
-            for organ in &self.topology.organs {
-                if organ.health < min_health {
-                    min_health = organ.health;
-                }
-            }
+        // Pull metrics from telemetry.
+        let cpu_gpu = self.telemetry.read_cpu_gpu_metrics();
+        let mem = self.telemetry.read_memory_metrics();
+        let io = self.telemetry.read_io_metrics();
 
-            let health_level = if min_health >= 0.85 {
-                "healthy"
-            } else if min_health >= 0.6 {
-                "degraded"
-            } else if min_health >= 0.35 {
-                "impaired"
-            } else if min_health > 0.0 {
-                "critical"
-            } else {
-                "failed"
-            };
+        // Update shared metrics snapshot for the `metrics` command + HTTP.
+        if let Ok(mut guard) = self.metrics_snapshot.lock() {
+            *guard = Some(TelemetrySnapshot { cpu: cpu_gpu, mem, io });
+        }
 
-            let awareness = compute_awareness(&self.topology);
+        let brief;
+
+        if let Ok(mut topo) = self.topology.lock() {
+            // Apply telemetry-driven health adjustments.
+            Self::apply_telemetry_to_topology(&mut *topo, &cpu_gpu, &mem, &io);
+
+            // Recompute awareness from updated topology.
+            let awareness = organism::compute_awareness(&*topo);
+            let awareness_label = organism::describe_awareness(awareness);
+
+            brief = format_topology_brief(&*topo);
+
+            let overall_health = compute_overall_health(&*topo);
+            let health_label = classify_health(overall_health);
+
             bus.awareness_score = awareness;
 
+            let msg = format!(
+                "status tick #{} :: {} :: health {:.2} ({}) :: awareness {:.2} ({})",
+                self.counter, brief, overall_health, health_label, awareness, awareness_label
+            );
+
+            // Store the last status line in memory (global scope).
+            bus.memory
+                .set_text(MemoryScope::Global, "kernel.last_status", msg.clone());
+
+            bus.emit(PulseKind::Status, self.name(), msg);
+        } else {
             bus.emit(
                 PulseKind::Status,
                 self.name(),
-                format!(
-                    "status tick #{} :: {} :: health {:.2} ({}) :: awareness {:.2}",
-                    self.counter, brief, min_health, health_level, awareness
-                ),
+                "status tick: failed to lock topology",
             );
         }
     }
 }
 
 /// A daemon representing the AI Cortex: all high-level intelligence lives here.
-/// It reacts to the awareness index carried on the bus.
+///
+/// In this early phase it observes awareness and logs a coarse "policy"
+/// about how the system should behave, and writes that decision into the MemoryBus.
 pub struct AiDaemon {
     last_run: Instant,
     interval: Duration,
     cycle: u64,
+    topology: Arc<Mutex<SystemTopology>>,
 }
 
 impl AiDaemon {
-    pub fn new(interval: Duration) -> Self {
+    pub fn new(interval: Duration, topology: Arc<Mutex<SystemTopology>>) -> Self {
         Self {
             last_run: Instant::now(),
             interval,
             cycle: 0,
+            topology,
         }
     }
 }
@@ -210,31 +305,131 @@ impl Daemon for AiDaemon {
     }
 
     fn tick(&mut self, now: Instant, bus: &mut Bus) {
-        if now.duration_since(self.last_run) >= self.interval {
-            self.cycle += 1;
-            self.last_run = now;
+        if now.duration_since(self.last_run) < self.interval {
+            return;
+        }
 
-            let awareness = bus.awareness_score;
-            let level = if awareness >= 0.85 {
-                "optimal"
-            } else if awareness >= 0.6 {
-                "stable"
-            } else if awareness >= 0.35 {
-                "impaired"
-            } else if awareness > 0.0 {
-                "critical"
-            } else {
-                "unconscious"
+        self.cycle += 1;
+        self.last_run = now;
+
+        let awareness = if let Ok(topo) = self.topology.lock() {
+            organism::compute_awareness(&*topo)
+        } else {
+            bus.awareness_score
+        };
+        let label = organism::describe_awareness(awareness);
+
+        // Tiny policy brain: decide what we *would* do.
+        let policy = if awareness >= 0.85 {
+            "policy=push_capacity"          // safe to run heavy workloads
+        } else if awareness >= 0.60 {
+            "policy=maintain_load"          // keep as is
+        } else if awareness >= 0.35 {
+            "policy=reduce_load"            // consider reducing sim/load
+        } else if awareness > 0.0 {
+            // Critical: also force sim_level off as a protective reflex.
+            if bus.sim_level != SimLevel::Off {
+                bus.sim_level = SimLevel::Off;
+            }
+            "policy=protect_core(sim_off)"   // emergency mode
+        } else {
+            "policy=recover_offline"        // unconscious
+        };
+
+        // Write policy + awareness into the shared MemoryBus (global scope).
+        bus.memory
+            .set_text(MemoryScope::Global, "cortex.policy", policy);
+        bus.memory
+            .set_text(MemoryScope::Global, "cortex.awareness", format!("{:.3}", awareness));
+        bus.memory
+            .set_text(MemoryScope::Global, "cortex.awareness_label", label);
+
+        let msg = format!(
+            "cortex cycle #{} :: awareness {:.2} ({}) :: {}",
+            self.cycle, awareness, label, policy
+        );
+
+        bus.emit(PulseKind::Ai, self.name(), msg);
+    }
+}
+
+/// A daemon that simulates environmental pressure / recovery.
+/// This is separate from telemetry and purely synthetic, controlled by sim_level.
+pub struct SimulationDaemon {
+    last_run: Instant,
+    interval: Duration,
+    tick: u64,
+    topology: Arc<Mutex<SystemTopology>>,
+}
+
+impl SimulationDaemon {
+    pub fn new(interval: Duration, topology: Arc<Mutex<SystemTopology>>) -> Self {
+        Self {
+            last_run: Instant::now(),
+            interval,
+            tick: 0,
+            topology,
+        }
+    }
+
+    fn nudge_health(organ: &mut Organ, delta: f32) {
+        organ.health = (organ.health + delta).clamp(0.0, 1.0);
+    }
+}
+
+impl Daemon for SimulationDaemon {
+    fn name(&self) -> &'static str {
+        "sim"
+    }
+
+    fn tick(&mut self, now: Instant, bus: &mut Bus) {
+        if now.duration_since(self.last_run) < self.interval {
+            return;
+        }
+
+        self.last_run = now;
+        self.tick = self.tick.wrapping_add(1);
+
+        if bus.sim_level == SimLevel::Off {
+            return;
+        }
+
+        if let Ok(mut topo) = self.topology.lock() {
+            if topo.organs.is_empty() {
+                return;
+            }
+
+            let idx = (self.tick % topo.organs.len() as u64) as usize;
+            let organ = &mut topo.organs[idx];
+
+            let (delta, label) = match bus.sim_level {
+                SimLevel::Low => {
+                    // Mostly small negative hits, occasional recovery.
+                    if self.tick % 5 == 0 {
+                        (0.02, "recovery")
+                    } else {
+                        (-0.01, "stress")
+                    }
+                }
+                SimLevel::High => {
+                    if self.tick % 3 == 0 {
+                        (0.03, "recovery")
+                    } else {
+                        (-0.04, "stress")
+                    }
+                }
+                SimLevel::Off => {
+                    return;
+                }
             };
 
-            bus.emit(
-                PulseKind::Ai,
-                self.name(),
-                format!(
-                    "cortex cycle #{} :: awareness {:.2} ({})",
-                    self.cycle, awareness, level
-                ),
+            Self::nudge_health(organ, delta);
+
+            let msg = format!(
+                "{} tick on {:?}: health now {:.2}",
+                label, organ.kind, organ.health
             );
+            bus.emit(PulseKind::Sim, self.name(), msg);
         }
     }
 }
@@ -243,134 +438,266 @@ impl Daemon for AiDaemon {
 /// This is the first AION "shell" interface.
 pub struct CommandDaemon {
     rx: Receiver<String>,
-    topology: SystemTopology,
+    topology: Arc<Mutex<SystemTopology>>,
+    metrics_snapshot: Arc<Mutex<Option<TelemetrySnapshot>>>,
 }
 
 impl CommandDaemon {
-    pub fn new(rx: Receiver<String>, topology: SystemTopology) -> Self {
-        Self { rx, topology }
+    pub fn new(
+        rx: Receiver<String>,
+        topology: Arc<Mutex<SystemTopology>>,
+        metrics_snapshot: Arc<Mutex<Option<TelemetrySnapshot>>>,
+    ) -> Self {
+        Self {
+            rx,
+            topology,
+            metrics_snapshot,
+        }
     }
 
-    fn parse_organ_kind(&self, name: &str) -> Option<OrganKind> {
+    fn parse_organ_kind(name: &str) -> Option<OrganKind> {
         match name.to_lowercase().as_str() {
             "cortex" => Some(OrganKind::Cortex),
             "memory" => Some(OrganKind::Memory),
-            "io" | "io_bridge" | "io-bridge" | "iobridge" => Some(OrganKind::IoBridge),
+            "iobridge" | "io" => Some(OrganKind::IoBridge),
+            "sensorhub" => Some(OrganKind::SensorHub),
+            "motorcontrol" | "motor" => Some(OrganKind::MotorControl),
+            "network" => Some(OrganKind::Network),
+            "storage" => Some(OrganKind::Storage),
             _ => None,
         }
     }
 
-    fn adjust_organ_health(&mut self, kind: OrganKind, delta: f32) -> Option<f32> {
-        for organ in self.topology.organs.iter_mut() {
-            if organ.kind == kind {
-                let new_health = (organ.health + delta).clamp(0.0, 1.0);
-                organ.health = new_health;
-                return Some(new_health);
-            }
-        }
-        None
-    }
-
-    fn classify_health_label(&self, health: f32) -> &'static str {
-        if health >= 0.85 {
-            "ok"
-        } else if health >= 0.6 {
-            "degraded"
-        } else if health >= 0.35 {
-            "impaired"
-        } else if health > 0.0 {
-            "critical"
-        } else {
-            "failed"
-        }
-    }
-
-    fn health_severity(&self, health: f32) -> u8 {
-        if health >= 0.85 {
-            0 // ok
-        } else if health >= 0.6 {
-            1 // degraded
-        } else if health >= 0.35 {
-            2 // impaired
-        } else if health > 0.0 {
-            3 // critical
-        } else {
-            4 // failed
-        }
-    }
-
-    /// Save organ health to a simple text file.
-    /// Format (one per line): <OrganKindName> <health>
-    fn save_state(&self, path: &str) -> Result<(), String> {
+    fn organ_health_report(topology: &SystemTopology) -> String {
         let mut out = String::new();
-        for organ in &self.topology.organs {
-            let name = match organ.kind {
-                OrganKind::Cortex => "Cortex",
-                OrganKind::Memory => "Memory",
-                OrganKind::IoBridge => "IoBridge",
-                OrganKind::SensorHub => "SensorHub",
-                OrganKind::MotorControl => "MotorControl",
-                OrganKind::Network => "Network",
-                OrganKind::Storage => "Storage",
-            };
-            out.push_str(&format!("{} {:.4}\n", name, organ.health));
+        out.push_str("Organ health:\n");
+        for organ in &topology.organs {
+            let label = classify_health(organ.health);
+            out.push_str(&format!(" - {:?}: {:.2} ({})\n", organ.kind, organ.health, label));
         }
-
-        fs::write(path, out).map_err(|e| format!("failed to save state: {}", e))?;
-        Ok(())
+        out
     }
 
-    /// Load organ health from a simple text file.
-    /// Unknown organs or malformed lines are ignored.
-    fn load_state(&mut self, path: &str) -> Result<(), String> {
-        let data = fs::read_to_string(path).map_err(|e| format!("failed to load state: {}", e))?;
+    fn alerts_report(topology: &SystemTopology) -> String {
+        let mut out = String::new();
+        out.push_str("Alerts:\n");
 
-        for line in data.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+        let mut any = false;
+        let mut min_health: f32 = 1.0;
+
+        for organ in &topology.organs {
+            min_health = min_health.min(organ.health);
+            let label = classify_health(organ.health);
+            if label != "ok" {
+                any = true;
+                out.push_str(&format!(" - {:?}: {:.2} [{}]\n", organ.kind, organ.health, label));
             }
+        }
 
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() != 2 {
-                continue;
+        if !any {
+            out.push_str(" (no active alerts; all organs healthy)\n");
+        } else {
+            out.push_str(&format!("overall: {}\n", classify_health(min_health)));
+        }
+
+        out
+    }
+
+    fn sim_status_report(topology: &SystemTopology, bus: &Bus) -> String {
+        let min_health = compute_overall_health(topology);
+        let awareness = bus.awareness_score;
+        format!(
+            "simulation status: level={:?} :: min health {:.2} :: awareness {:.2}",
+            bus.sim_level, min_health, awareness
+        )
+    }
+
+    fn handle_damage(
+        &self,
+        parts: &[&str],
+        bus: &mut Bus,
+    ) -> Option<String> {
+        if parts.len() != 3 {
+            return Some("usage: damage <organ> <amount>".to_string());
+        }
+        let organ_name = parts[1];
+        let amount_str = parts[2];
+        let amount: f32 = match amount_str.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                return Some(format!("invalid amount: {}", amount_str));
             }
+        };
 
-            let organ_name = parts[0];
-            let value_str = parts[1];
+        let kind = match Self::parse_organ_kind(organ_name) {
+            Some(k) => k,
+            None => {
+                return Some(format!("unknown organ '{}'", organ_name));
+            }
+        };
 
-            // First: try the generic parser (handles cortex/memory/io/etc.)
-            let organ_kind_opt = self
-                .parse_organ_kind(organ_name)
-                .or_else(|| match organ_name {
-                    // Also support exact names used when saving
-                    "IoBridge" => Some(OrganKind::IoBridge),
-                    "SensorHub" => Some(OrganKind::SensorHub),
-                    "MotorControl" => Some(OrganKind::MotorControl),
-                    "Network" => Some(OrganKind::Network),
-                    "Storage" => Some(OrganKind::Storage),
-                    _ => None,
-                });
-
-            let organ_kind = match organ_kind_opt {
-                Some(k) => k,
-                None => continue,
-            };
-
-            let value: f32 = match value_str.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            // Apply new health
-            for organ in self.topology.organs.iter_mut() {
-                if organ.kind == organ_kind {
-                    organ.health = value.clamp(0.0, 1.0);
+        if let Ok(mut topo) = self.topology.lock() {
+            let mut new_health = None;
+            for organ in &mut topo.organs {
+                if organ.kind == kind {
+                    organ.health = (organ.health - amount).clamp(0.0, 1.0);
+                    new_health = Some(organ.health);
+                    break;
                 }
             }
+            if let Some(h) = new_health {
+                let awareness = organism::compute_awareness(&*topo);
+                bus.awareness_score = awareness;
+                let label = organism::describe_awareness(awareness);
+                return Some(format!(
+                    "damaged {:?} by {:.2}, new health {:.2} (awareness {:.2} {})",
+                    kind, amount, h, awareness, label
+                ));
+            } else {
+                return Some(format!("organ {:?} not found in topology", kind));
+            }
+        } else {
+            Some("failed to lock topology for damage".to_string())
+        }
+    }
+
+    fn handle_heal(
+        &self,
+        parts: &[&str],
+        bus: &mut Bus,
+    ) -> Option<String> {
+        if parts.len() != 3 {
+            return Some("usage: heal <organ> <amount>".to_string());
+        }
+        let organ_name = parts[1];
+        let amount_str = parts[2];
+        let amount: f32 = match amount_str.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                return Some(format!("invalid amount: {}", amount_str));
+            }
+        };
+
+        let kind = match Self::parse_organ_kind(organ_name) {
+            Some(k) => k,
+            None => {
+                return Some(format!("unknown organ '{}'", organ_name));
+            }
+        };
+
+        if let Ok(mut topo) = self.topology.lock() {
+            let mut new_health = None;
+            for organ in &mut topo.organs {
+                if organ.kind == kind {
+                    organ.health = (organ.health + amount).clamp(0.0, 1.0);
+                    new_health = Some(organ.health);
+                    break;
+                }
+            }
+            if let Some(h) = new_health {
+                let awareness = organism::compute_awareness(&*topo);
+                bus.awareness_score = awareness;
+                let label = organism::describe_awareness(awareness);
+                return Some(format!(
+                    "healed {:?} by {:.2}, new health {:.2} (awareness {:.2} {})",
+                    kind, amount, h, awareness, label
+                ));
+            } else {
+                return Some(format!("organ {:?} not found in topology", kind));
+            }
+        } else {
+            Some("failed to lock topology for heal".to_string())
+        }
+    }
+
+    fn handle_save_state(&self, _bus: &mut Bus) -> String {
+        if let Ok(topo) = self.topology.lock() {
+            let mut lines = Vec::new();
+            for organ in &topo.organs {
+                lines.push(format!("{:?} {:.5}", organ.kind, organ.health));
+            }
+            match fs::write("aion_state.txt", lines.join("\n")) {
+                Ok(_) => "state saved to aion_state.txt".to_string(),
+                Err(e) => format!("failed to save state: {}", e),
+            }
+        } else {
+            "failed to lock topology for save".to_string()
+        }
+    }
+
+    fn handle_load_state(&self, bus: &mut Bus) -> String {
+        let content = match fs::read_to_string("aion_state.txt") {
+            Ok(c) => c,
+            Err(e) => return format!("failed to load state: {}", e),
+        };
+
+        if let Ok(mut topo) = self.topology.lock() {
+            for line in content.lines() {
+                let mut parts = line.split_whitespace();
+                let kind_str = match parts.next() {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let health_str = match parts.next() {
+                    Some(h) => h,
+                    None => continue,
+                };
+
+                let kind = match Self::parse_organ_kind(kind_str) {
+                    Some(k) => k,
+                    None => continue,
+                };
+
+                let h: f32 = match health_str.parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                for organ in &mut topo.organs {
+                    if organ.kind == kind {
+                        organ.health = h.clamp(0.0, 1.0);
+                        break;
+                    }
+                }
+            }
+
+            let awareness = organism::compute_awareness(&*topo);
+            bus.awareness_score = awareness;
+            let label = organism::describe_awareness(awareness);
+            format!(
+                "state loaded from aion_state.txt (awareness {:.2} {})",
+                awareness, label
+            )
+        } else {
+            "failed to lock topology for load".to_string()
+        }
+    }
+
+    fn handle_mem(parts: &[&str], bus: &mut Bus) -> Option<String> {
+        // mem / mem ls – list everything (text dump)
+        if parts.len() == 1 || (parts.len() == 2 && parts[1] == "ls") {
+            return Some(bus.memory.dump());
         }
 
-        Ok(())
+        // mem get <key>
+        if parts.len() >= 3 && parts[1] == "get" {
+            let key = parts[2];
+            match bus.memory.get(MemoryScope::Global, key) {
+                Some(v) => Some(format!("mem[{}] = {}", key, v)),
+                None => Some(format!("mem: key '{}' not found", key)),
+            }
+        }
+        // mem set <key> <value>
+        else if parts.len() >= 4 && parts[1] == "set" {
+            let key = parts[2];
+            let value = parts[3..].join(" ");
+            bus.memory.set_text(MemoryScope::Global, key, value);
+            Some(format!("mem[{}] updated", key))
+        } else {
+            Some(
+                "usage: mem [ls] | mem get <key> | mem set <key> <value>".to_string(),
+            )
+        }
     }
 }
 
@@ -388,404 +715,257 @@ impl Daemon for CommandDaemon {
                         continue;
                     }
 
-                    // Parameterized commands: damage/heal
-                    if let Some(rest) = trimmed.strip_prefix("damage ") {
-                        let parts: Vec<&str> = rest.split_whitespace().collect();
-                        if parts.len() != 2 {
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                "usage: damage <organ> <amount>",
-                            );
-                            continue;
-                        }
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
 
-                        let organ_name = parts[0];
-                        let amount_str = parts[1];
-
-                        let organ_kind = match self.parse_organ_kind(organ_name) {
-                            Some(k) => k,
-                            None => {
-                                bus.emit(
-                                    PulseKind::Command,
-                                    self.name(),
-                                    format!("unknown organ '{}'", organ_name),
-                                );
-                                continue;
-                            }
-                        };
-
-                        let amount: f32 = match amount_str.parse() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                bus.emit(
-                                    PulseKind::Command,
-                                    self.name(),
-                                    format!("invalid amount '{}'", amount_str),
-                                );
-                                continue;
-                            }
-                        };
-
-                        let delta = -amount.abs();
-                        match self.adjust_organ_health(organ_kind, delta) {
-                            Some(new_health) => {
-                                let awareness = compute_awareness(&self.topology);
-                                bus.awareness_score = awareness;
-
-                                bus.emit(
-                                    PulseKind::Command,
-                                    self.name(),
-                                    format!(
-                                        "damaged {:?} by {:.2}, new health {:.2} (awareness {:.2})",
-                                        organ_kind, amount, new_health, awareness
-                                    ),
-                                );
-                            }
-                            None => {
-                                bus.emit(
-                                    PulseKind::Command,
-                                    self.name(),
-                                    format!(
-                                        "organ {:?} not found in topology",
-                                        organ_kind
-                                    ),
-                                );
-                            }
-                        }
-
-                        continue;
-                    }
-
-                    if let Some(rest) = trimmed.strip_prefix("heal ") {
-                        let parts: Vec<&str> = rest.split_whitespace().collect();
-                        if parts.len() != 2 {
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                "usage: heal <organ> <amount>",
-                            );
-                            continue;
-                        }
-
-                        let organ_name = parts[0];
-                        let amount_str = parts[1];
-
-                        let organ_kind = match self.parse_organ_kind(organ_name) {
-                            Some(k) => k,
-                            None => {
-                                bus.emit(
-                                    PulseKind::Command,
-                                    self.name(),
-                                    format!("unknown organ '{}'", organ_name),
-                                );
-                                continue;
-                            }
-                        };
-
-                        let amount: f32 = match amount_str.parse() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                bus.emit(
-                                    PulseKind::Command,
-                                    self.name(),
-                                    format!("invalid amount '{}'", amount_str),
-                                );
-                                continue;
-                            }
-                        };
-
-                        let delta = amount.abs();
-                        match self.adjust_organ_health(organ_kind, delta) {
-                            Some(new_health) => {
-                                let awareness = compute_awareness(&self.topology);
-                                bus.awareness_score = awareness;
-
-                                bus.emit(
-                                    PulseKind::Command,
-                                    self.name(),
-                                    format!(
-                                        "healed {:?} by {:.2}, new health {:.2} (awareness {:.2})",
-                                        organ_kind, amount, new_health, awareness
-                                    ),
-                                );
-                            }
-                            None => {
-                                bus.emit(
-                                    PulseKind::Command,
-                                    self.name(),
-                                    format!(
-                                        "organ {:?} not found in topology",
-                                        organ_kind
-                                    ),
-                                );
-                            }
-                        }
-
-                        continue;
-                    }
-
-                    // Simple commands (no parameters)
-                    match trimmed {
-                        "help" => {
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                "commands: help, status, topology, nodes, organs, peripherals, health, awareness, alerts, save state, load state, damage <organ> <amount>, heal <organ> <amount>, logs all, logs commands, logs silent, quit",
-                            );
-                        }
+                    let response = match parts[0] {
+                        "help" => Some(
+                            "commands: help, status, topology, nodes, organs, peripherals, health, \
+                             awareness, metrics, mode, alerts, sim status, sim level <off|low|high>, \
+                             mem, mem get <key>, mem set <key> <value>, \
+                             save state, load state, damage <organ> <amount>, heal <organ> <amount>, \
+                             logs all, logs commands, logs silent, quit"
+                                .to_string(),
+                        ),
 
                         "status" => {
-                            let brief = format_topology_brief(&self.topology);
-                            let awareness = compute_awareness(&self.topology);
-                            bus.awareness_score = awareness;
-
-                            // Also compute overall system health for human-readable status
-                            let mut min_health = 1.0f32;
-                            for organ in &self.topology.organs {
-                                if organ.health < min_health {
-                                    min_health = organ.health;
-                                }
+                            if let Ok(topo) = self.topology.lock() {
+                                let brief = format_topology_brief(&*topo);
+                                let overall_health = compute_overall_health(&*topo);
+                                let health_label = classify_health(overall_health);
+                                let awareness = bus.awareness_score;
+                                let awareness_label = organism::describe_awareness(awareness);
+                                Some(format!(
+                                    "manual status :: {} :: health {:.2} ({}) :: awareness {:.2} ({})",
+                                    brief, overall_health, health_label, awareness, awareness_label
+                                ))
+                            } else {
+                                Some("failed to lock topology".to_string())
                             }
-                            let health_level = self.classify_health_label(min_health);
-
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                format!(
-                                    "manual status :: {} :: health {:.2} ({}) :: awareness {:.2}",
-                                    brief, min_health, health_level, awareness
-                                ),
-                            );
                         }
 
                         "topology" => {
-                            let mut details = String::new();
-                            details.push_str("Topology detail:\n");
-                            for node in &self.topology.nodes {
-                                details.push_str(&format!(
-                                    " - Node {} [{}]: {}\n",
-                                    node.id.0, node.label, node.role
-                                ));
+                            if let Ok(topo) = self.topology.lock() {
+                                let mut details = String::new();
+                                details.push_str("Topology detail:\n");
+                                for node in &topo.nodes {
+                                    details.push_str(&format!(
+                                        " - Node {} [{}]: {}\n",
+                                        node.id.0, node.label, node.role
+                                    ));
+                                }
+                                for organ in &topo.organs {
+                                    details.push_str(&format!(
+                                        "   - Organ {:?} on Node {} (health {:.2})\n",
+                                        organ.kind, organ.node.0, organ.health
+                                    ));
+                                }
+                                Some(details)
+                            } else {
+                                Some("failed to lock topology".to_string())
                             }
-                            for organ in &self.topology.organs {
-                                details.push_str(&format!(
-                                    "   - Organ {:?} on Node {} (health {:.2})\n",
-                                    organ.kind, organ.node.0, organ.health
-                                ));
-                            }
-
-                            bus.emit(PulseKind::Command, self.name(), details);
                         }
 
                         "nodes" => {
-                            let mut details = String::new();
-                            details.push_str("Nodes:\n");
-                            for node in &self.topology.nodes {
-                                details.push_str(&format!(
-                                    " - Node {} [{}]: {}\n",
-                                    node.id.0, node.label, node.role
-                                ));
+                            if let Ok(topo) = self.topology.lock() {
+                                let mut details = String::new();
+                                details.push_str("Nodes:\n");
+                                for node in &topo.nodes {
+                                    details.push_str(&format!(
+                                        " - Node {} [{}]: {}\n",
+                                        node.id.0, node.label, node.role
+                                    ));
+                                }
+                                Some(details)
+                            } else {
+                                Some("failed to lock topology".to_string())
                             }
-                            bus.emit(PulseKind::Command, self.name(), details);
                         }
 
                         "organs" => {
-                            let mut details = String::new();
-                            details.push_str("Organs:\n");
-                            for organ in &self.topology.organs {
-                                details.push_str(&format!(
-                                    " - Organ {:?} on Node {} (health {:.2})\n",
-                                    organ.kind, organ.node.0, organ.health
-                                ));
+                            if let Ok(topo) = self.topology.lock() {
+                                let mut details = String::new();
+                                details.push_str("Organs:\n");
+                                for organ in &topo.organs {
+                                    details.push_str(&format!(
+                                        " - Organ {:?} on Node {} (health {:.2})\n",
+                                        organ.kind, organ.node.0, organ.health
+                                    ));
+                                }
+                                Some(details)
+                            } else {
+                                Some("failed to lock topology".to_string())
                             }
-                            bus.emit(PulseKind::Command, self.name(), details);
                         }
 
                         "peripherals" => {
-                            let mut details = String::new();
-                            details.push_str("Peripherals by organ:\n");
-                            for organ in &self.topology.organs {
-                                if organ.peripherals.is_empty() {
-                                    continue;
+                            if let Ok(topo) = self.topology.lock() {
+                                let mut details = String::new();
+                                details.push_str("Peripherals by organ:\n");
+                                for organ in &topo.organs {
+                                    if organ.peripherals.is_empty() {
+                                        continue;
+                                    }
+                                    details.push_str(&format!(" - Organ {:?}:\n", organ.kind));
+                                    for p in &organ.peripherals {
+                                        details.push_str(&format!("    - {:?}: {}\n", p.kind, p.name));
+                                    }
                                 }
-                                details.push_str(&format!(" - Organ {:?}:\n", organ.kind));
-                                for p in &organ.peripherals {
-                                    details.push_str(&format!(
-                                        "    - {:?}: {}\n",
-                                        p.kind, p.name
-                                    ));
+                                if !details.contains("Organ") {
+                                    details.push_str(" (no peripherals registered)\n");
                                 }
+                                Some(details)
+                            } else {
+                                Some("failed to lock topology".to_string())
                             }
-                            if !details.contains("Organ") {
-                                details.push_str(" (no peripherals registered)\n");
-                            }
-                            bus.emit(PulseKind::Command, self.name(), details);
                         }
 
                         "health" => {
-                            let mut details = String::new();
-                            details.push_str("Organ health:\n");
-                            for organ in &self.topology.organs {
-                                let label = self.classify_health_label(organ.health);
-                                details.push_str(&format!(
-                                    " - {:?}: {:.2} ({})\n",
-                                    organ.kind, organ.health, label
-                                ));
-                            }
-                            bus.emit(PulseKind::Command, self.name(), details);
-                        }
-
-                        "alerts" => {
-                            let mut details = String::new();
-                            let mut worst_severity = 0u8;
-                            let mut any_alerts = false;
-
-                            details.push_str("Alerts:\n");
-
-                            for organ in &self.topology.organs {
-                                let sev = self.health_severity(organ.health);
-                                if sev == 0 {
-                                    continue; // ok, no alert
-                                }
-                                any_alerts = true;
-                                if sev > worst_severity {
-                                    worst_severity = sev;
-                                }
-
-                                let label = self.classify_health_label(organ.health);
-                                details.push_str(&format!(
-                                    " - {:?}: {:.2} [{}]\n",
-                                    organ.kind, organ.health, label
-                                ));
-                            }
-
-                            if !any_alerts {
-                                details.push_str(" (no active alerts; all organs healthy)\n");
+                            if let Ok(topo) = self.topology.lock() {
+                                Some(Self::organ_health_report(&*topo))
                             } else {
-                                let overall = match worst_severity {
-                                    1 => "overall: degraded",
-                                    2 => "overall: impaired",
-                                    3 => "overall: critical",
-                                    4 => "overall: failed",
-                                    _ => "overall: ok",
-                                };
-                                details.push_str(overall);
-                                details.push('\n');
+                                Some("failed to lock topology for health".to_string())
                             }
-
-                            bus.emit(PulseKind::Command, self.name(), details);
                         }
 
                         "awareness" => {
-                            let score = compute_awareness(&self.topology);
-                            bus.awareness_score = score;
-
-                            let level = if score >= 0.85 {
-                                "optimal"
-                            } else if score >= 0.6 {
-                                "stable"
-                            } else if score >= 0.35 {
-                                "impaired"
-                            } else if score > 0.0 {
-                                "critical"
+                            if let Ok(topo) = self.topology.lock() {
+                                let awareness = organism::compute_awareness(&*topo);
+                                let label = organism::describe_awareness(awareness);
+                                Some(format!("awareness index: {:.2} :: {}", awareness, label))
                             } else {
-                                "unconscious"
+                                Some("failed to lock topology for awareness".to_string())
+                            }
+                        }
+
+                        "alerts" => {
+                            if let Ok(topo) = self.topology.lock() {
+                                Some(Self::alerts_report(&*topo))
+                            } else {
+                                Some("failed to lock topology for alerts".to_string())
+                            }
+                        }
+
+                        "mode" => {
+                            let tele_str = match bus.telemetry_mode {
+                                TelemetryMode::Simulated => "simulated",
+                                TelemetryMode::Real => "real",
                             };
-
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                format!("awareness index: {:.2} :: {}", score, level),
-                            );
+                            Some(format!(
+                                "mode :: telemetry={} :: sim_level={:?}",
+                                tele_str, bus.sim_level
+                            ))
                         }
 
-                        "save state" => {
-                            match self.save_state("aion_state.txt") {
-                                Ok(()) => {
-                                    bus.emit(
-                                        PulseKind::Command,
-                                        self.name(),
-                                        "state saved to aion_state.txt",
-                                    );
+                        "metrics" => {
+                            match self.metrics_snapshot.lock() {
+                                Ok(guard) => {
+                                    if let Some(snap) = *guard {
+                                        let mut out = String::new();
+                                        out.push_str("Metrics snapshot (from status daemon):\n");
+                                        out.push_str(" Cortex / CPU+GPU:\n");
+                                        out.push_str(&format!(
+                                            "  cpu_load      : {:.2}\n  cpu_temp_c    : {:.1}\n  throttling    : {}\n  gpu_load      : {:.2}\n  gpu_mem_util  : {:.2}\n",
+                                            snap.cpu.cpu_load,
+                                            snap.cpu.cpu_temp_c,
+                                            snap.cpu.throttling_events,
+                                            snap.cpu.gpu_load,
+                                            snap.cpu.gpu_mem_util,
+                                        ));
+                                        out.push_str(" Memory:\n");
+                                        out.push_str(&format!(
+                                            "  ram_used      : {:.2}\n  swap_used     : {:.2}\n  page_faults   : {:.1}\n  disk_latency  : {:.1} ms\n",
+                                            snap.mem.ram_used_ratio,
+                                            snap.mem.swap_used_ratio,
+                                            snap.mem.major_page_faults,
+                                            snap.mem.disk_latency_ms,
+                                        ));
+                                        out.push_str(" IoBridge / IO+Net:\n");
+                                        out.push_str(&format!(
+                                            "  net_loss      : {:.3}\n  net_latency   : {:.1} ms\n  io_queue      : {:.2}\n  io_error_rate : {:.3}\n",
+                                            snap.io.net_packet_loss,
+                                            snap.io.net_latency_ms,
+                                            snap.io.io_queue_depth,
+                                            snap.io.io_error_rate,
+                                        ));
+                                        Some(out)
+                                    } else {
+                                        Some(
+                                            "metrics not yet available (status daemon has not produced a snapshot)"
+                                                .to_string(),
+                                        )
+                                    }
                                 }
-                                Err(e) => {
-                                    bus.emit(
-                                        PulseKind::Command,
-                                        self.name(),
-                                        format!("save failed: {}", e),
-                                    );
-                                }
+                                Err(_) => Some("failed to lock metrics snapshot".to_string()),
                             }
                         }
 
-                        "load state" => {
-                            match self.load_state("aion_state.txt") {
-                                Ok(()) => {
-                                    let awareness = compute_awareness(&self.topology);
-                                    bus.awareness_score = awareness;
-
-                                    bus.emit(
-                                        PulseKind::Command,
-                                        self.name(),
-                                        format!(
-                                            "state loaded from aion_state.txt (awareness {:.2})",
-                                            awareness
-                                        ),
-                                    );
-                                }
-                                Err(e) => {
-                                    bus.emit(
-                                        PulseKind::Command,
-                                        self.name(),
-                                        format!("load failed: {}", e),
-                                    );
-                                }
+                        "sim" if parts.len() > 1 && parts[1] == "status" => {
+                            if let Ok(topo) = self.topology.lock() {
+                                Some(Self::sim_status_report(&*topo, bus))
+                            } else {
+                                Some("failed to lock topology for sim status".to_string())
                             }
                         }
 
-                        "logs all" => {
+                        "sim" if parts.len() > 2 && parts[1] == "level" => {
+                            let level_str = parts[2].to_lowercase();
+                            match level_str.as_str() {
+                                "off" => {
+                                    bus.sim_level = SimLevel::Off;
+                                    Some("simulation level set to off".to_string())
+                                }
+                                "low" => {
+                                    bus.sim_level = SimLevel::Low;
+                                    Some("simulation level set to low".to_string())
+                                }
+                                "high" => {
+                                    bus.sim_level = SimLevel::High;
+                                    Some("simulation level set to high".to_string())
+                                }
+                                _ => Some(
+                                    "usage: sim level <off|low|high>".to_string(),
+                                ),
+                            }
+                        }
+
+                        "mem" => Self::handle_mem(&parts, bus),
+
+                        "damage" => self.handle_damage(&parts, bus),
+                        "heal" => self.handle_heal(&parts, bus),
+
+                        "save" if parts.len() > 1 && parts[1] == "state" => {
+                            Some(self.handle_save_state(bus))
+                        }
+
+                        "load" if parts.len() > 1 && parts[1] == "state" => {
+                            Some(self.handle_load_state(bus))
+                        }
+
+                        "logs" if parts.len() > 1 && parts[1] == "all" => {
                             bus.log_filter = LogFilter::All;
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                "logging: ALL pulses",
-                            );
+                            Some("logging: ALL pulses".to_string())
                         }
-
-                        "logs commands" => {
+                        "logs" if parts.len() > 1 && parts[1] == "commands" => {
                             bus.log_filter = LogFilter::CommandsOnly;
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                "logging: COMMANDS ONLY",
-                            );
+                            Some("logging: COMMANDS ONLY".to_string())
                         }
-
-                        "logs silent" | "logs off" => {
+                        "logs" if parts.len() > 1 && (parts[1] == "silent" || parts[1] == "off") => {
                             bus.log_filter = LogFilter::Silent;
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                "logging: SILENT",
-                            );
+                            Some("logging: SILENT".to_string())
                         }
 
                         "quit" => {
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                "shutting down kernel (process::exit(0))",
-                            );
-                            process::exit(0);
+                            Some("shutting down kernel (process::exit(0))".to_string())
                         }
 
-                        _ => {
-                            bus.emit(
-                                PulseKind::Command,
-                                self.name(),
-                                format!("unknown command: '{}'", trimmed),
-                            );
+                        _ => Some(format!("unknown command: '{}'", trimmed)),
+                    };
+
+                    if let Some(msg) = response {
+                        bus.emit(PulseKind::Command, self.name(), msg);
+
+                        if trimmed == "quit" {
+                            process::exit(0);
                         }
                     }
                 }
@@ -803,11 +983,51 @@ impl Daemon for CommandDaemon {
     }
 }
 
+/// Compute an overall health score from the topology.
+/// Currently: min health across all organs.
+pub fn compute_overall_health(topo: &SystemTopology) -> f32 {
+    if topo.organs.is_empty() {
+        return 1.0;
+    }
+    topo.organs
+        .iter()
+        .map(|o| o.health)
+        .fold(1.0, |acc, h| acc.min(h))
+}
+
+/// Turn a health score into a simple label.
+fn classify_health(h: f32) -> &'static str {
+    if h >= 0.85 {
+        "ok"
+    } else if h >= 0.6 {
+        "degraded"
+    } else if h >= 0.35 {
+        "impaired"
+    } else if h > 0.0 {
+        "critical"
+    } else {
+        "failed"
+    }
+}
+
 /// Very simple blocking kernel loop that runs all daemons and uses the bus.
 pub fn run_loop(mut bus: Bus) {
     println!("[AION-KERNEL] Entering daemon loop. Ctrl+C to exit.");
 
-    let topology = organism::sample_topology();
+    let topology = Arc::new(Mutex::new(organism::sample_topology()));
+
+    // Shared metrics snapshot between status + command daemons + HTTP.
+    let metrics_snapshot: Arc<Mutex<Option<TelemetrySnapshot>>> =
+        Arc::new(Mutex::new(None));
+
+    // Start tiny HTTP server (status & metrics & mem).
+    let http_server = HttpServer::new("127.0.0.1:8080");
+    let mem_for_http = bus.memory.clone();
+    http_server.start(
+        Arc::clone(&topology),
+        Arc::clone(&metrics_snapshot),
+        mem_for_http,
+    );
 
     // Set up a channel + thread to read stdin commands.
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
@@ -835,13 +1055,52 @@ pub fn run_loop(mut bus: Bus) {
 
     let mut daemons: Vec<Box<dyn Daemon>> = Vec::new();
 
+    // Shared topology for all daemons.
+    let topo_for_status = Arc::clone(&topology);
+    let topo_for_ai = Arc::clone(&topology);
+    let topo_for_sim = Arc::clone(&topology);
+    let topo_for_cmd = Arc::clone(&topology);
+
+    // Metrics snapshot clones.
+    let metrics_for_status = Arc::clone(&metrics_snapshot);
+    let metrics_for_cmd = Arc::clone(&metrics_snapshot);
+
+    // Telemetry provider: select from env var AION_TELEMETRY.
+    let telemetry: Box<dyn TelemetryProvider> = {
+        let mode = std::env::var("AION_TELEMETRY").unwrap_or_else(|_| "sim".to_string());
+        match mode.as_str() {
+            "real" => {
+                bus.telemetry_mode = TelemetryMode::Real;
+                Box::new(RealTelemetry::new(SimLevel::Low))
+            }
+            _ => {
+                bus.telemetry_mode = TelemetryMode::Simulated;
+                Box::new(SimulatedTelemetry::new(SimLevel::Low))
+            }
+        }
+    };
+
+    // Later: build this list from config, discovery, etc.
     daemons.push(Box::new(HeartbeatDaemon::new(Duration::from_millis(1000))));
     daemons.push(Box::new(StatusDaemon::new(
         Duration::from_millis(5000),
-        topology.clone(),
+        topo_for_status,
+        telemetry,
+        metrics_for_status,
     )));
-    daemons.push(Box::new(AiDaemon::new(Duration::from_millis(2000))));
-    daemons.push(Box::new(CommandDaemon::new(cmd_rx, topology)));
+    daemons.push(Box::new(AiDaemon::new(
+        Duration::from_millis(2000),
+        topo_for_ai,
+    )));
+    daemons.push(Box::new(SimulationDaemon::new(
+        Duration::from_millis(2500),
+        topo_for_sim,
+    )));
+    daemons.push(Box::new(CommandDaemon::new(
+        cmd_rx,
+        topo_for_cmd,
+        metrics_for_cmd,
+    )));
 
     loop {
         let now = Instant::now();

@@ -1,6 +1,12 @@
 [package]
 name = "acid-aion"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+sysinfo = "0.30"
+tiny_http = "0.12.0"
+
+[features]
+default = []
+real-telemetry = []
